@@ -1,0 +1,44 @@
+{
+  "realm": "spillway",
+  "displayName": "Spillway",
+  "enabled": true,
+  "sslRequired": "external",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "verifyEmail": false,
+  "bruteForceProtected": true,
+  "roles": {
+    "realm": [
+      { "name": "admin", "description": "Informational only: authorization comes from Spillway memberships, not token roles" },
+      { "name": "operator", "description": "Informational only: authorization comes from Spillway memberships, not token roles" }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "spillway-web",
+      "name": "Spillway web",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": ["${PUBLIC_SCHEME}://${DOMAIN}/*"],
+      "webOrigins": ["${PUBLIC_SCHEME}://${DOMAIN}"],
+      "attributes": { "pkce.code.challenge.method": "S256", "post.logout.redirect.uris": "${PUBLIC_SCHEME}://${DOMAIN}/*" },
+      "protocolMappers": [
+        {
+          "name": "spillway-api-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": { "included.custom.audience": "spillway-api", "access.token.claim": "true", "id.token.claim": "false" }
+        },
+        {
+          "name": "org-claim",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-claim-mapper",
+          "config": { "claim.name": "org", "claim.value": "${DEFAULT_ORG_SLUG}", "jsonType.label": "String", "access.token.claim": "true", "id.token.claim": "true", "userinfo.token.claim": "true" }
+        }
+      ]
+    }
+  ]
+}

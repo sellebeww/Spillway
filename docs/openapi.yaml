@@ -1,0 +1,353 @@
+openapi: 3.0.3
+info:
+  title: Spillway API
+  version: "0.6.0"
+  description: |
+    Community flood-watch platform. NOT an official early warning system; it does not replace BMKG,
+    BNPB or BPBD. Alerts can be late or fail to deliver; thresholds must be set by local authorities.
+
+    Authenticated endpoints need an OIDC access token (RS256) as `Authorization: Bearer`. The
+    organization comes from the token (never from the request); roles come from Spillway memberships:
+    `admin` (whole organization) and `operator` (assigned sites). Resources of another organization or
+    of a site the caller may not access answer 404. Mutations are audited. Responses never contain
+    secrets, except the device secret, which is returned once by registration and by rotation.
+    This file is kept in sync with the router by a contract test.
+servers:
+  - url: /
+tags:
+  - name: public
+    description: No authentication, read-only, only is_public sites. Rate limited per IP.
+  - name: ingest
+  - name: sites
+  - name: devices
+  - name: rules
+  - name: alerts
+  - name: telegram
+  - name: admin
+paths:
+  /v1/ingest:
+    post:
+      tags: [ingest]
+      summary: Ingest one signed telemetry message (see docs/PROTOCOL.md)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { type: object } }
+      responses:
+        "200": { description: Stored or duplicate (committed) }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { description: Unknown device or bad signature (identical answers) }
+        "413": { description: Payload larger than 1 KiB }
+        "422": { description: Too old or device not calibrated }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "503": { description: Busy; retry after the Retry-After header }
+  /v1/public/sites:
+    get:
+      tags: [public]
+      summary: GeoJSON of public sites with latest level, status and stale label
+      security: []
+      responses:
+        "200": { description: GeoJSON FeatureCollection }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /v1/public/sites/{slug}:
+    get:
+      tags: [public]
+      summary: One public site (a private or unknown slug answers the same 404)
+      security: []
+      parameters: [{ $ref: "#/components/parameters/Slug" }]
+      responses:
+        "200": { description: "Site with devices, level, status, updated_at, stale label, severity (highest open alert, 0 = none), thresholds of enabled THRESHOLD rules and alerts of the last 30 days (no rule or organization ids)" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /v1/public/sites/{slug}/series:
+    get:
+      tags: [public]
+      summary: Water level series; aggregate resolution chosen from the range
+      security: []
+      parameters:
+        - { $ref: "#/components/parameters/Slug" }
+        - { name: res, in: query, schema: { type: string, enum: [auto, raw, 1m, 1h, 1d], default: auto } }
+        - { name: from, in: query, schema: { type: string, format: date-time }, description: Default now minus 24 h }
+        - { name: to, in: query, schema: { type: string, format: date-time }, description: Default now; range at most 400 days }
+        - { name: device, in: query, schema: { type: string, format: uuid }, description: Default the first device of the site }
+      responses:
+        "200": { description: "Points (max 5000, `truncated` flags a cap); only readings with quality score >= 0.5" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /v1/public/stream:
+    get:
+      tags: [public]
+      summary: Server-sent events of new readings (heartbeat comments, Last-Event-ID replay)
+      security: []
+      parameters:
+        - { name: site, in: query, schema: { type: string }, description: Public site slug; default all public sites }
+        - { name: Last-Event-ID, in: header, schema: { type: string } }
+      responses:
+        "200": { description: text/event-stream }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { description: Too many streams from this IP or rate limited }
+        "503": { description: Streaming unavailable }
+  /v1/me:
+    get:
+      tags: [admin]
+      summary: The authenticated user and roles
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200": { description: user_id, email, admin, site_ids }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { description: Account not linked to an organization }
+  /v1/sites:
+    get:
+      tags: [sites]
+      summary: Sites the caller may access
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Limit" }, { $ref: "#/components/parameters/Offset" }]
+      responses:
+        "200": { description: Paged list }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [sites]
+      summary: Create a site (admin)
+      security: [{ bearerAuth: [] }]
+      requestBody: { $ref: "#/components/requestBodies/Json" }
+      responses:
+        "201": { description: Created }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /v1/sites/{id}:
+    get:
+      tags: [sites]
+      summary: One site
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200": { description: Site }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      tags: [sites]
+      summary: Replace a site (admin)
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      requestBody: { $ref: "#/components/requestBodies/Json" }
+      responses:
+        "200": { description: Updated }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /v1/sites/{id}/devices:
+    get:
+      tags: [devices]
+      summary: Devices of a site
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }, { $ref: "#/components/parameters/Limit" }, { $ref: "#/components/parameters/Offset" }]
+      responses:
+        "200": { description: Paged list }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [devices]
+      summary: Register a device; the response contains its secret, shown once
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      requestBody: { $ref: "#/components/requestBodies/Json" }
+      responses:
+        "201": { description: "device and one-time `secret` (64 hex), Cache-Control no-store" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /v1/sites/{id}/rules:
+    get:
+      tags: [rules]
+      summary: Alert rules of a site
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }, { $ref: "#/components/parameters/Limit" }, { $ref: "#/components/parameters/Offset" }]
+      responses:
+        "200": { description: Paged list }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [rules]
+      summary: Create a THRESHOLD or RATE_OF_RISE rule (strict validation)
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      requestBody: { $ref: "#/components/requestBodies/Json" }
+      responses:
+        "201": { description: Created }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/sites/{id}/alerts:
+    get:
+      tags: [alerts]
+      summary: Alert events of a site, newest first
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }, { $ref: "#/components/parameters/Limit" }, { $ref: "#/components/parameters/Offset" }]
+      responses:
+        "200": { description: Paged list }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/sites/{id}/channels:
+    get:
+      tags: [telegram]
+      summary: Active Telegram channels subscribed to a site (chat ids masked)
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }, { $ref: "#/components/parameters/Limit" }, { $ref: "#/components/parameters/Offset" }]
+      responses:
+        "200": { description: Paged list }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/sites/{id}/subscription-links:
+    post:
+      tags: [telegram]
+      summary: Issue a single-use Telegram invitation link (24 h); the token is shown once
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "201": { description: url and expires_at }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: Telegram bot not configured }
+  /v1/sites/{id}/subscription-links/revoke:
+    post:
+      tags: [telegram]
+      summary: Revoke all unused invitation links of a site
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200": { description: Number revoked }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/sites/{id}/operators:
+    post:
+      tags: [admin]
+      summary: Assign an existing user (by e-mail) as operator of a site (admin)
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      requestBody: { $ref: "#/components/requestBodies/Json" }
+      responses:
+        "201": { description: Membership created }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /v1/devices/{id}:
+    get:
+      tags: [devices]
+      summary: One device (never includes its secret)
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200": { description: Device }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/devices/{id}/rotate-secret:
+    post:
+      tags: [devices]
+      summary: Replace the device secret; the new secret is shown once
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200": { description: One-time `secret` (64 hex), Cache-Control no-store }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/devices/{id}/health:
+    get:
+      tags: [devices]
+      summary: Device status, 1 h health score and 24 h battery trend
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200": { description: "status, stale, health_score, battery_slope_v_per_day, last_reading (newest reading of the last 24 h with raw_mm and level_cm, or null)" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/devices/{id}/calibrations:
+    get:
+      tags: [devices]
+      summary: Calibration history (append-only versions)
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }, { $ref: "#/components/parameters/Limit" }, { $ref: "#/components/parameters/Offset" }]
+      responses:
+        "200": { description: Paged list }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [devices]
+      summary: Add a calibration version; backdating needs confirm_backdate
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      requestBody: { $ref: "#/components/requestBodies/Json" }
+      responses:
+        "201": { description: Created }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: valid_from precedes the active version and backdating was not confirmed }
+  /v1/rules/{id}:
+    get:
+      tags: [rules]
+      summary: One rule
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200": { description: Rule }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      tags: [rules]
+      summary: Replace a rule (strict validation)
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      requestBody: { $ref: "#/components/requestBodies/Json" }
+      responses:
+        "200": { description: Updated }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/audit:
+    get:
+      tags: [admin]
+      summary: Audit log of configuration changes (admin)
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Limit" }, { $ref: "#/components/parameters/Offset" }]
+      responses:
+        "200": { description: Paged list, newest first }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer, bearerFormat: JWT }
+  parameters:
+    Id: { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    Slug: { name: slug, in: path, required: true, schema: { type: string, pattern: "^[a-z0-9][a-z0-9-]{1,62}$" } }
+    Limit: { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+    Offset: { name: offset, in: query, schema: { type: integer, minimum: 0, default: 0 } }
+  requestBodies:
+    Json:
+      required: true
+      content:
+        application/json: { schema: { type: object } }
+  responses:
+    BadRequest: { description: "Invalid input; body {error:{code,message}}", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    Unauthorized: { description: Missing or invalid token, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    Forbidden: { description: Role not allowed, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    NotFound: { description: Not found (also for other organizations and unassigned sites), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    Conflict: { description: Conflicts with an existing resource, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    RateLimited: { description: Too many requests; see Retry-After, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties: { code: { type: string }, message: { type: string } }

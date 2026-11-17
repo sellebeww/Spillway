@@ -1,0 +1,10 @@
+# Copyright (c) 2026 Vassel Goleyu. MIT License.
+# Keycloak with the build step done at image build time, so every container start is fast
+# (a plain `start` rebuilds the server on each start: minutes of CPU and a memory spike).
+FROM quay.io/keycloak/keycloak:26.0 AS builder
+ENV KC_DB=postgres KC_HEALTH_ENABLED=true
+RUN /opt/keycloak/bin/kc.sh build
+
+FROM quay.io/keycloak/keycloak:26.0
+COPY --from=builder /opt/keycloak/ /opt/keycloak/
+ENTRYPOINT ["/opt/keycloak/bin/kc.sh"]

@@ -1,0 +1,7 @@
+# Shared device account: may only publish telemetry, never read anything.
+user device
+topic write spillway/v1/+/telemetry
+
+# Service account: subscribes to telemetry only (more rights arrive with later phases).
+user spillway
+topic read spillway/v1/+/telemetry

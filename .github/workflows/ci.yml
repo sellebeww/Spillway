@@ -1,0 +1,101 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./cmd/... ./internal/... ./migrations/... ./tools/...
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.15
+      # Docker is preinstalled on the runner: testcontainers-based tests (later phases) work without service containers.
+      - run: go test -race ./cmd/... ./internal/... ./migrations/... ./tools/...
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm run check
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+
+  firmware:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: firmware/esp32
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ hashFiles('firmware/esp32/platformio.ini') }}
+      - run: pip install platformio
+      # Protocol golden vectors on the host, then a real ESP32 build. Hardware behavior is not tested in CI.
+      - run: pio test -e native
+      - run: cp include/secrets.example.h include/secrets.h
+      - run: pio run -e esp32dev
+
+  images:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.spillway
+          push: false
+          tags: spillway:ci
+          cache-from: type=gha,scope=spillway
+          cache-to: type=gha,scope=spillway,mode=max
+      - uses: docker/build-push-action@v6
+        with:
+          context: web
+          push: false
+          tags: spillway-web:ci
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,scope=web,mode=max
+
+  # Brings up the production compose stack (Postgres+Timescale, Redis, Mosquitto, Keycloak, Spillway, web, Caddy)
+  # as real containers and runs the smoke test. Nothing is deployed anywhere.
+  smoke:
+    runs-on: ubuntu-latest
+    needs: [images]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Prepare throwaway environment
+        run: |
+          sed -e 's/^DOMAIN=.*/DOMAIN=localhost/' -e 's/^PUBLIC_SCHEME=.*/PUBLIC_SCHEME=http/' \
+              -e 's/CHANGE_ME/ci-throwaway-pass/' deploy/compose/.env.prod.example > deploy/compose/.env.prod
+          sed -i "s#^SPILLWAY_SECRET_KEY=.*#SPILLWAY_SECRET_KEY=$(openssl rand -base64 32)#" deploy/compose/.env.prod
+      - run: deploy/scripts/smoke.sh
+      - if: failure()
+        run: docker compose --env-file deploy/compose/.env.prod -f deploy/compose/docker-compose.prod.yml logs --tail=80

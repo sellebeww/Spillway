@@ -1,0 +1,216 @@
+# Production stack. Run from the repository root:
+#   docker compose --env-file deploy/compose/.env.prod -f deploy/compose/docker-compose.prod.yml up -d --build
+# See docs/DEPLOY.md. Only Caddy (80/443) and, optionally, MQTT (8883 TLS, 1883 plain) are published.
+name: spillway
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "5" }
+
+services:
+  postgres:
+    image: timescale/timescaledb-ha:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: spillway
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: spillway
+      KEYCLOAK_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:?set KEYCLOAK_DB_PASSWORD}
+    volumes:
+      - pgdata:/home/postgres/pgdata
+      - ../postgres/init-keycloak.sh:/docker-entrypoint-initdb.d/init-keycloak.sh:ro
+    healthcheck:
+      # TCP on purpose: during first-time init the temporary server listens on the socket only.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U spillway -d spillway"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    shm_size: 256mb
+    deploy: { resources: { limits: { memory: "${POSTGRES_MEM_LIMIT:-2g}" } } }
+    logging: *logging
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Append-only file: dedupe keys and last values survive a restart (the database unique index is the safety net regardless).
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "volatile-lru"]
+    volumes: ["redisdata:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    deploy: { resources: { limits: { memory: 384m } } }
+    logging: *logging
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    restart: unless-stopped
+    environment:
+      MQTT_DEVICE_PASSWORD: ${MQTT_DEVICE_PASSWORD:?set MQTT_DEVICE_PASSWORD}
+      MQTT_SERVICE_PASSWORD: ${MQTT_SERVICE_PASSWORD:?set MQTT_SERVICE_PASSWORD}
+    entrypoint: ["/bin/sh", "/mosquitto/entrypoint.sh"]
+    ports:
+      - "${MQTT_TLS_BIND:-0.0.0.0}:8883:8883"
+      # Plain MQTT stays on loopback unless you decide otherwise (credentials would cross the network unencrypted).
+      - "${MQTT_PLAIN_BIND:-127.0.0.1}:1883:1883"
+    volumes:
+      - ../mosquitto/entrypoint.prod.sh:/mosquitto/entrypoint.sh:ro
+      - ../mosquitto/mosquitto.prod.conf:/mosquitto/config/mosquitto.prod.conf:ro
+      - ../mosquitto/acl:/mosquitto/config/acl:ro
+      - ${MQTT_CERT_DIR:-../mosquitto/certs}:/mosquitto/certs:ro
+      - mqttdata:/mosquitto/data
+    healthcheck:
+      # mosquitto_sub exits 27 on a clean timeout (connected, nothing received); other codes mean failure.
+      test: ["CMD-SHELL", "mosquitto_sub -h localhost -u spillway -P \"$$MQTT_SERVICE_PASSWORD\" -t spillway/v1/healthcheck/telemetry -W 1; [ $$? -eq 27 ]"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    deploy: { resources: { limits: { memory: 512m } } }
+    logging: *logging
+
+  migrate:
+    build: { context: ../.., dockerfile: deploy/docker/Dockerfile.spillway }
+    image: spillway:${SPILLWAY_TAG:-local}
+    command: ["migrate"]
+    restart: "no"
+    environment: &spillway-env
+      DATABASE_URL: postgres://spillway:${POSTGRES_PASSWORD}@postgres:5432/spillway?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      SPILLWAY_SECRET_KEY: ${SPILLWAY_SECRET_KEY:?set SPILLWAY_SECRET_KEY}
+      SPILLWAY_SECRET_KEY_VERSION: ${SPILLWAY_SECRET_KEY_VERSION:-1}
+      SPILLWAY_SECRET_KEY_OLD: ${SPILLWAY_SECRET_KEY_OLD:-}
+      SPILLWAY_RAW_RETENTION_DAYS: ${SPILLWAY_RAW_RETENTION_DAYS:-90}
+      SPILLWAY_ENV: production
+      SPILLWAY_LOG_LEVEL: ${SPILLWAY_LOG_LEVEL:-info}
+      SPILLWAY_HTTP_ADDR: 0.0.0.0:8080
+      MQTT_URL: tcp://mosquitto:1883
+      MQTT_USERNAME: spillway
+      MQTT_PASSWORD: ${MQTT_SERVICE_PASSWORD}
+      OIDC_ISSUER: ${PUBLIC_SCHEME:-https}://auth.${DOMAIN}/realms/spillway
+      # Keys are fetched inside the network, not through the public name.
+      OIDC_JWKS_URL: http://keycloak:8080/realms/spillway/protocol/openid-connect/certs
+      OIDC_AUDIENCE: spillway-api
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:?set BOOTSTRAP_ADMIN_EMAIL}
+      DEFAULT_ORG_SLUG: ${DEFAULT_ORG_SLUG:-main}
+      CORS_ORIGINS: ${PUBLIC_SCHEME:-https}://${DOMAIN}
+      TRUST_PROXY_HEADERS: "true"
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_BOT_USERNAME: ${TELEGRAM_BOT_USERNAME:-}
+      PUBLIC_BASE_URL: ${PUBLIC_SCHEME:-https}://${DOMAIN}
+    depends_on:
+      postgres: { condition: service_healthy }
+    logging: *logging
+
+  spillway:
+    image: spillway:${SPILLWAY_TAG:-local}
+    restart: unless-stopped
+    command: ["serve"]
+    environment: *spillway-env
+    # Loopback only: for /metrics and local checks. Caddy reaches it on the internal network.
+    ports: ["127.0.0.1:${SPILLWAY_LOCAL_PORT:-8080}:8080"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+      mosquitto: { condition: service_healthy }
+    stop_grace_period: 40s
+    deploy: { resources: { limits: { memory: "${SPILLWAY_MEM_LIMIT:-1g}" } } }
+    logging: *logging
+
+  web:
+    build: { context: ../../web }
+    image: spillway-web:${SPILLWAY_TAG:-local}
+    restart: unless-stopped
+    environment:
+      ORIGIN: ${PUBLIC_SCHEME:-https}://${DOMAIN}
+      ADDRESS_HEADER: X-Forwarded-For
+      XFF_DEPTH: "1"
+      API_URL: http://spillway:8080
+      PUBLIC_API_URL: ${PUBLIC_SCHEME:-https}://${DOMAIN}
+      OIDC_ISSUER: ${PUBLIC_SCHEME:-https}://auth.${DOMAIN}/realms/spillway
+      OIDC_CLIENT_ID: spillway-web
+      TILE_URL: ${TILE_URL:-https://tile.openstreetmap.org/{z}/{x}/{y}.png}
+      TILE_ATTRIBUTION: ${TILE_ATTRIBUTION:-© OpenStreetMap contributors}
+    depends_on:
+      spillway: { condition: service_healthy }
+    deploy: { resources: { limits: { memory: 384m } } }
+    logging: *logging
+
+  keycloak:
+    build: { context: ../.., dockerfile: deploy/docker/Dockerfile.keycloak }
+    image: spillway-keycloak:${SPILLWAY_TAG:-local}
+    restart: unless-stopped
+    command: ["start", "--optimized", "--import-realm"]
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD}
+      KC_HOSTNAME: ${PUBLIC_SCHEME:-https}://auth.${DOMAIN}
+      KC_HTTP_ENABLED: "true" # TLS ends at Caddy
+      KC_PROXY_HEADERS: xforwarded
+      KC_HEALTH_ENABLED: "true"
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?set KEYCLOAK_ADMIN_PASSWORD}
+      # Substituted into realm-prod.json at import.
+      PUBLIC_SCHEME: ${PUBLIC_SCHEME:-https}
+      DOMAIN: ${DOMAIN:?set DOMAIN}
+      DEFAULT_ORG_SLUG: ${DEFAULT_ORG_SLUG:-main}
+    # The admin console is not exposed by Caddy; reach it through: ssh -L 8081:localhost:8081 and the loopback port below.
+    ports: ["127.0.0.1:8081:8080"]
+    volumes:
+      - ../keycloak/realm-prod.json:/opt/keycloak/data/import/realm-prod.json:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >
+          exec 3<>/dev/tcp/127.0.0.1/9000 &&
+          printf 'GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3 &&
+          grep -q '"status": "UP"' <&3
+      interval: 10s
+      timeout: 5s
+      retries: 60 # first start builds the server and imports the realm: minutes on a small VPS
+      start_period: 120s
+    deploy: { resources: { limits: { memory: 1280m } } }
+    logging: *logging
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      DOMAIN: ${DOMAIN}
+      PUBLIC_SCHEME: ${PUBLIC_SCHEME:-https}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ../caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    # The web server and the API validate the public names; resolve them to Caddy inside the network
+    # so no traffic leaves the host and the certificate Caddy serves is the one checked.
+    networks:
+      default:
+        aliases: ["${DOMAIN}", "auth.${DOMAIN}"]
+    depends_on:
+      spillway: { condition: service_healthy }
+      web: { condition: service_healthy }
+      # Started, not healthy: the public site must not wait for (or go down with) the sign-in service.
+      keycloak: { condition: service_started }
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2019/config/"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+    deploy: { resources: { limits: { memory: 128m } } }
+    logging: *logging
+
+volumes:
+  pgdata:
+  redisdata:
+  mqttdata:
+  caddy_data:
+  caddy_config:

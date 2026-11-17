@@ -1,0 +1,9 @@
+.git
+.env
+.env.*
+web
+firmware
+docs
+**/node_modules
+**/.pio
+*.log

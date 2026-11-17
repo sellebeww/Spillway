@@ -1,0 +1,37 @@
+# Site addresses carry the scheme: https://example.com gets a Let's Encrypt certificate
+# automatically; http://localhost (smoke test) stays plain.
+{
+	email {$ACME_EMAIL:}
+}
+
+{$PUBLIC_SCHEME}://{$DOMAIN} {
+	encode zstd gzip
+	# Browsers ignore HSTS over plain http (smoke test), so it is safe to send in every mode.
+	header Strict-Transport-Security "max-age=31536000"
+
+	# Operational endpoints are not public. Scrape /metrics from the host (127.0.0.1:8080).
+	@internal path /metrics /readyz
+	respond @internal 404
+
+	# Live stream: never buffer server-sent events.
+	handle /v1/public/stream {
+		reverse_proxy spillway:8080 {
+			flush_interval -1
+		}
+	}
+	handle /v1/* {
+		reverse_proxy spillway:8080
+	}
+	handle {
+		reverse_proxy web:3000
+	}
+}
+
+{$PUBLIC_SCHEME}://auth.{$DOMAIN} {
+	# ">" replaces the value Keycloak sends itself (it adds includeSubDomains), so there is exactly one header.
+	header >Strict-Transport-Security "max-age=31536000"
+	# Only what the OIDC flow needs; the admin console is reachable through an SSH tunnel (docs/DEPLOY.md).
+	@admin path /admin /admin/* /realms/master /realms/master/*
+	respond @admin 404
+	reverse_proxy keycloak:8080
+}

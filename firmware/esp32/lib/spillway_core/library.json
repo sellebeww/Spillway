@@ -1,0 +1,7 @@
+{
+  "name": "spillway_core",
+  "version": "0.1.0",
+  "description": "Portable Spillway telemetry core (canonical string, payload, signing)",
+  "authors": [{ "name": "Vassel Goleyu" }],
+  "license": "MIT"
+}

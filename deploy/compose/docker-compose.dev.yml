@@ -1,0 +1,78 @@
+# Development infrastructure only. Not for production (see deploy/ for that, later phase).
+name: spillway-dev
+
+services:
+  postgres:
+    # Single image bundling PostgreSQL 17 + TimescaleDB + PostGIS (see docs/DECISIONS.md).
+    image: timescale/timescaledb-ha:pg17
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports: ["127.0.0.1:${POSTGRES_PORT:-5432}:5432"]
+    volumes: ["pgdata:/home/postgres/pgdata"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports: ["127.0.0.1:${REDIS_PORT:-6379}:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    environment:
+      MQTT_DEVICE_PASSWORD: ${MQTT_DEVICE_PASSWORD}
+      MQTT_SERVICE_PASSWORD: ${MQTT_SERVICE_PASSWORD}
+    # Password file is built from env at start so no credential is committed.
+    command:
+      - sh
+      - -c
+      - >
+        mosquitto_passwd -b -c /mosquitto/passwd device "$$MQTT_DEVICE_PASSWORD" &&
+        mosquitto_passwd -b /mosquitto/passwd spillway "$$MQTT_SERVICE_PASSWORD" &&
+        chown mosquitto:mosquitto /mosquitto/passwd &&
+        exec mosquitto -c /mosquitto/config/mosquitto.conf
+    ports: ["127.0.0.1:${MQTT_PORT:-1883}:1883"]
+    volumes:
+      - ../mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ../mosquitto/acl:/mosquitto/config/acl:ro
+    healthcheck:
+      # mosquitto_sub exits 27 on a clean timeout (connected, nothing received); other codes mean failure.
+      test: ["CMD-SHELL", "mosquitto_sub -h localhost -u spillway -P \"$$MQTT_SERVICE_PASSWORD\" -t spillway/v1/healthcheck/telemetry -W 1; [ $$? -eq 27 ]"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+      KC_HEALTH_ENABLED: "true"
+    ports: ["127.0.0.1:${KEYCLOAK_PORT:-8081}:8080"]
+    volumes:
+      - ../keycloak/realm-dev.json:/opt/keycloak/data/import/realm-dev.json:ro
+    healthcheck:
+      # The image has no curl; probe the management port (9000) with bash /dev/tcp.
+      test:
+        - CMD-SHELL
+        - >
+          exec 3<>/dev/tcp/127.0.0.1/9000 &&
+          printf 'GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3 &&
+          grep -q '"status": "UP"' <&3
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+volumes:
+  pgdata:
